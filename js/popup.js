@@ -113,6 +113,13 @@ class MAICKeyManager {
 
     initializeUI() {
         document.addEventListener('DOMContentLoaded', () => {
+            // Theme toggle
+            const themeToggle = document.getElementById('themeToggle');
+            if (themeToggle) {
+                themeToggle.addEventListener('click', () => this.toggleTheme());
+            }
+
+            // Login form
             const loginForm = document.getElementById('loginForm');
             if (loginForm) {
                 loginForm.addEventListener('submit', (e) => {
@@ -122,13 +129,36 @@ class MAICKeyManager {
                 });
             }
 
-            const themeToggle = document.getElementById('themeToggle');
-            if (themeToggle) {
-                themeToggle.addEventListener('click', () => this.toggleTheme());
+            // Tabs
+            const tabs = document.querySelectorAll('.tab');
+            tabs.forEach(tab => {
+                tab.addEventListener('click', () => this.switchTab(tab.dataset.tab));
+            });
+
+            // Generate key button
+            const generateKeyBtn = document.getElementById('generateKey');
+            if (generateKeyBtn) {
+                generateKeyBtn.addEventListener('click', () => this.generateNewKey());
             }
 
-            this.initializeButtons();
-            this.initializeTabs();
+            // Import key button
+            const importKeyBtn = document.getElementById('importKey');
+            if (importKeyBtn) {
+                importKeyBtn.addEventListener('click', () => this.showImportModal());
+            }
+
+            // Sign message button
+            const signMessageBtn = document.getElementById('signMessage');
+            if (signMessageBtn) {
+                signMessageBtn.addEventListener('click', () => this.signMessage());
+            }
+
+            // Initialize history
+            this.history = [];
+            this.loadHistory();
+
+            // Load theme
+            this.loadTheme();
         });
     }
 
@@ -192,155 +222,624 @@ class MAICKeyManager {
     async copyToClipboard(text) {
         try {
             await navigator.clipboard.writeText(text);
-            this.showNotification('Copied to clipboard!');
+            this.showNotification('Copied to clipboard successfully!');
         } catch (err) {
             this.showError('Failed to copy to clipboard');
+            console.error('Failed to copy:', err);
         }
     }
 
     async copyPublicKey(index) {
         const key = this.keys[index];
-        await this.copyToClipboard(key.publicKey);
-        this.showNotification('Public key copied to clipboard');
+        if (key && key.publicKey) {
+            await this.copyToClipboard(key.publicKey);
+        }
     }
 
     async copyPrivateKey(index) {
         const key = this.keys[index];
-        let privateKey = key.privateKey;
-        
-        if (key.isEncrypted) {
-            privateKey = MACICrypto.decryptPrivateKey(key.privateKey, this.password, key.salt);
+        if (key && key.encryptedPrivateKey && this.password) {
+            try {
+                const decryptedKey = MACICrypto.decryptPrivateKey(
+                    key.encryptedPrivateKey,
+                    this.password,
+                    key.salt
+                );
+                await this.copyToClipboard(decryptedKey);
+            } catch (error) {
+                console.error('Error decrypting private key:', error);
+                this.showError('Failed to copy private key');
+            }
         }
-        
-        await this.copyToClipboard(privateKey);
-        this.showNotification('Private key copied to clipboard');
     }
 
-    async copyAddress(index) {
-        const key = this.keys[index];
-        await this.copyToClipboard(key.address);
+    async copySignedMessage(message, signature) {
+        if (message && signature) {
+            const textToCopy = `Message: ${message}\nSignature: ${signature}`;
+            await this.copyToClipboard(textToCopy);
+        }
+    }
+
+    deleteKey(index) {
+        if (index >= 0 && index < this.keys.length) {
+            this.keys.splice(index, 1);
+            chrome.storage.local.set({ keys: this.keys });
+            this.updateKeysList();
+            this.updateKeySelector();
+            this.showNotification('Key deleted successfully');
+        }
     }
 
     showImportModal() {
-        const modal = document.createElement('div');
-        modal.className = 'modal';
-        modal.innerHTML = `
-            <div class="modal-content">
-                <h3>Import Key</h3>
-                <div class="form-group">
-                    <input type="text" id="importPrivateKey" placeholder="Enter Private Key" class="input" />
-                    <button id="confirmImport" class="button primary">Import</button>
-                    <button id="cancelImport" class="button secondary">Cancel</button>
-                </div>
-            </div>
-        `;
-        document.body.appendChild(modal);
+        this.importKeys();
+    }
 
-        document.getElementById('confirmImport').addEventListener('click', async () => {
-            const privateKey = document.getElementById('importPrivateKey').value;
-            try {
-                const { publicKey } = await MACICrypto.generateKeypairFromPrivateKey(privateKey);
-                const newKey = {
-                    publicKey,
-                    privateKey,
-                    createdAt: new Date().toISOString(),
-                    status: 'active',
-                    keyType: 'EdDSA',
-                    purpose: 'A-MACI Voting'
-                };
-                
-                this.keys.push(newKey);
-                await chrome.storage.local.set({ keys: this.keys });
-                this.updateKeysList();
-                this.updateKeySelector();
-                this.showNotification('Key imported successfully!');
-                modal.remove();
-            } catch (error) {
-                this.showError('Invalid private key');
-            }
-        });
+    async importKeys() {
+        try {
+            const fileInput = document.createElement('input');
+            fileInput.type = 'file';
+            fileInput.accept = '.json';
+            
+            fileInput.onchange = async (e) => {
+                try {
+                    const file = e.target.files[0];
+                    if (!file) {
+                        this.showError('No file selected');
+                        return;
+                    }
 
-        document.getElementById('cancelImport').addEventListener('click', () => {
-            modal.remove();
-        });
+                    const reader = new FileReader();
+                    reader.onload = async (event) => {
+                        try {
+                            const importData = JSON.parse(event.target.result);
+                            
+                            // Validate import data structure
+                            if (!importData.keys || !Array.isArray(importData.keys)) {
+                                this.showError('Invalid key file format');
+                                return;
+                            }
+
+                            // Validate each key
+                            const validKeys = importData.keys.filter(key => 
+                                key.publicKey && 
+                                key.encryptedPrivateKey && 
+                                key.salt &&
+                                key.keyType
+                            );
+
+                            if (validKeys.length === 0) {
+                                this.showError('No valid keys found in import file');
+                                return;
+                            }
+
+                            // Add new keys to existing keys
+                            this.keys = [...this.keys, ...validKeys];
+                            localStorage.setItem('keys', JSON.stringify(this.keys));
+                            
+                            this.updateKeysList();
+                            this.updateKeySelector();
+                            
+                            this.showNotification(`Successfully imported ${validKeys.length} keys`);
+                        } catch (parseError) {
+                            console.error('Parse error:', parseError);
+                            this.showError('Failed to parse import file');
+                        }
+                    };
+
+                    reader.onerror = () => {
+                        this.showError('Error reading file');
+                    };
+
+                    reader.readAsText(file);
+                } catch (fileError) {
+                    console.error('File error:', fileError);
+                    this.showError('Error processing file');
+                }
+            };
+
+            fileInput.click();
+        } catch (error) {
+            console.error('Import error:', error);
+            this.showError('Failed to initiate import');
+        }
     }
 
     async exportKeys() {
-        const exportData = {
-            keys: this.keys,
-            timestamp: new Date().toISOString(),
-            version: '1.0.0'
-        };
+        try {
+            if (!this.keys || this.keys.length === 0) {
+                this.showError('No keys available to export');
+                return;
+            }
 
-        const blob = new Blob([JSON.stringify(exportData, null, 2)], { type: 'application/json' });
-        const url = URL.createObjectURL(blob);
-        const a = document.createElement('a');
-        a.href = url;
-        a.download = 'maci-keys-backup.json';
-        document.body.appendChild(a);
-        a.click();
-        document.body.removeChild(a);
-        URL.revokeObjectURL(url);
-        this.showNotification('Keys exported successfully!');
+            const exportData = {
+                version: '1.0',
+                timestamp: new Date().toISOString(),
+                keys: this.keys.map(key => ({
+                    publicKey: key.publicKey,
+                    encryptedPrivateKey: key.encryptedPrivateKey,
+                    salt: key.salt,
+                    keyType: key.keyType
+                }))
+            };
+
+            const blob = new Blob([JSON.stringify(exportData, null, 2)], { type: 'application/json' });
+            const url = URL.createObjectURL(blob);
+            
+            const a = document.createElement('a');
+            a.href = url;
+            a.download = `maci-keys-${new Date().toISOString().split('T')[0]}.json`;
+            document.body.appendChild(a);
+            a.click();
+            
+            URL.revokeObjectURL(url);
+            document.body.removeChild(a);
+            
+            this.showNotification('Keys exported successfully');
+        } catch (error) {
+            console.error('Export error:', error);
+            this.showError('Failed to export keys');
+        }
     }
 
     async generateNewKey() {
         try {
-            const { privateKey, publicKey, keyType } = await MACICrypto.generateKeypair();
+            if (!this.password) {
+                this.showError('Please log in first to generate keys');
+                return;
+            }
+
+            const keypair = await MACICrypto.generateKeypair();
+            const encryptedData = MACICrypto.encryptPrivateKey(keypair.privateKey, this.password);
             
             const newKey = {
-                publicKey,
-                privateKey,
+                publicKey: keypair.publicKey,
+                encryptedPrivateKey: encryptedData.encryptedKey,
+                salt: encryptedData.salt,
+                keyType: keypair.keyType,
                 createdAt: new Date().toISOString(),
-                status: 'active',
-                keyType,
-                purpose: 'A-MACI Voting'
+                status: 'active' // Default to active
             };
-            
-            if (this.password) {
-                const { encryptedKey, salt } = MACICrypto.encryptPrivateKey(privateKey, this.password);
-                newKey.privateKey = encryptedKey;
-                newKey.salt = salt;
-                newKey.isEncrypted = true;
-            }
-            
+
             this.keys.push(newKey);
-            await chrome.storage.local.set({ keys: this.keys });
+            localStorage.setItem('keys', JSON.stringify(this.keys));
             
             this.updateKeysList();
             this.updateKeySelector();
-            this.showNotification('New A-MACI keypair generated successfully!');
-            
+            this.showNotification('New key generated successfully');
         } catch (error) {
             console.error('Error generating key:', error);
-            this.showError('Error generating keypair: ' + error.message);
+            this.showError('Failed to generate new key');
+        }
+    }
+
+    updateKeySelector() {
+        const keySelector = document.getElementById('selectedKey');
+        if (!keySelector) return;
+
+        // Only show active keys in the selector
+        const activeKeys = this.keys.filter(key => key.status === 'active');
+        
+        keySelector.innerHTML = `
+            <option value="">Select Key</option>
+            ${activeKeys.map((key, index) => {
+                const keyIndex = this.keys.indexOf(key);
+                return `<option value="${keyIndex}">Key ${keyIndex + 1} - ${this.truncateKey(key.publicKey)}</option>`;
+            }).join('')}
+        `;
+    }
+
+    async copyToClipboard(text) {
+        try {
+            await navigator.clipboard.writeText(text);
+            this.showNotification('Copied to clipboard successfully!');
+        } catch (err) {
+            this.showError('Failed to copy to clipboard');
+            console.error('Failed to copy:', err);
+        }
+    }
+
+    async copyPublicKey(index) {
+        const key = this.keys[index];
+        if (key && key.publicKey) {
+            await this.copyToClipboard(key.publicKey);
+        }
+    }
+
+    async copyPrivateKey(index) {
+        const key = this.keys[index];
+        if (key && key.encryptedPrivateKey && this.password) {
+            try {
+                const decryptedKey = MACICrypto.decryptPrivateKey(
+                    key.encryptedPrivateKey,
+                    this.password,
+                    key.salt
+                );
+                await this.copyToClipboard(decryptedKey);
+            } catch (error) {
+                console.error('Error decrypting private key:', error);
+                this.showError('Failed to copy private key');
+            }
+        }
+    }
+
+    async copySignedMessage(message, signature) {
+        if (message && signature) {
+            const textToCopy = `Message: ${message}\nSignature: ${signature}`;
+            await this.copyToClipboard(textToCopy);
+        }
+    }
+
+    deleteKey(index) {
+        if (index >= 0 && index < this.keys.length) {
+            this.keys.splice(index, 1);
+            chrome.storage.local.set({ keys: this.keys });
+            this.updateKeysList();
+            this.updateKeySelector();
+            this.showNotification('Key deleted successfully');
+        }
+    }
+
+    showImportModal() {
+        this.importKeys();
+    }
+
+    async importKeys() {
+        try {
+            const fileInput = document.createElement('input');
+            fileInput.type = 'file';
+            fileInput.accept = '.json';
+            
+            fileInput.onchange = async (e) => {
+                try {
+                    const file = e.target.files[0];
+                    if (!file) {
+                        this.showError('No file selected');
+                        return;
+                    }
+
+                    const reader = new FileReader();
+                    reader.onload = async (event) => {
+                        try {
+                            const importData = JSON.parse(event.target.result);
+                            
+                            // Validate import data structure
+                            if (!importData.keys || !Array.isArray(importData.keys)) {
+                                this.showError('Invalid key file format');
+                                return;
+                            }
+
+                            // Validate each key
+                            const validKeys = importData.keys.filter(key => 
+                                key.publicKey && 
+                                key.encryptedPrivateKey && 
+                                key.salt &&
+                                key.keyType
+                            );
+
+                            if (validKeys.length === 0) {
+                                this.showError('No valid keys found in import file');
+                                return;
+                            }
+
+                            // Add new keys to existing keys
+                            this.keys = [...this.keys, ...validKeys];
+                            localStorage.setItem('keys', JSON.stringify(this.keys));
+                            
+                            this.updateKeysList();
+                            this.updateKeySelector();
+                            
+                            this.showNotification(`Successfully imported ${validKeys.length} keys`);
+                        } catch (parseError) {
+                            console.error('Parse error:', parseError);
+                            this.showError('Failed to parse import file');
+                        }
+                    };
+
+                    reader.onerror = () => {
+                        this.showError('Error reading file');
+                    };
+
+                    reader.readAsText(file);
+                } catch (fileError) {
+                    console.error('File error:', fileError);
+                    this.showError('Error processing file');
+                }
+            };
+
+            fileInput.click();
+        } catch (error) {
+            console.error('Import error:', error);
+            this.showError('Failed to initiate import');
+        }
+    }
+
+    async exportKeys() {
+        try {
+            if (!this.keys || this.keys.length === 0) {
+                this.showError('No keys available to export');
+                return;
+            }
+
+            const exportData = {
+                version: '1.0',
+                timestamp: new Date().toISOString(),
+                keys: this.keys.map(key => ({
+                    publicKey: key.publicKey,
+                    encryptedPrivateKey: key.encryptedPrivateKey,
+                    salt: key.salt,
+                    keyType: key.keyType
+                }))
+            };
+
+            const blob = new Blob([JSON.stringify(exportData, null, 2)], { type: 'application/json' });
+            const url = URL.createObjectURL(blob);
+            
+            const a = document.createElement('a');
+            a.href = url;
+            a.download = `maci-keys-${new Date().toISOString().split('T')[0]}.json`;
+            document.body.appendChild(a);
+            a.click();
+            
+            URL.revokeObjectURL(url);
+            document.body.removeChild(a);
+            
+            this.showNotification('Keys exported successfully');
+        } catch (error) {
+            console.error('Export error:', error);
+            this.showError('Failed to export keys');
+        }
+    }
+
+    async generateNewKey() {
+        try {
+            if (!this.password) {
+                this.showError('Please log in first to generate keys');
+                return;
+            }
+
+            const keypair = await MACICrypto.generateKeypair();
+            const encryptedData = MACICrypto.encryptPrivateKey(keypair.privateKey, this.password);
+            
+            const newKey = {
+                publicKey: keypair.publicKey,
+                encryptedPrivateKey: encryptedData.encryptedKey,
+                salt: encryptedData.salt,
+                keyType: keypair.keyType,
+                createdAt: new Date().toISOString(),
+                status: 'active' // Default to active
+            };
+
+            this.keys.push(newKey);
+            localStorage.setItem('keys', JSON.stringify(this.keys));
+            
+            this.updateKeysList();
+            this.updateKeySelector();
+            this.showNotification('New key generated successfully');
+        } catch (error) {
+            console.error('Error generating key:', error);
+            this.showError('Failed to generate new key');
+        }
+    }
+
+    updateKeySelector() {
+        const keySelector = document.getElementById('selectedKey');
+        if (!keySelector) return;
+
+        // Only show active keys in the selector
+        const activeKeys = this.keys.filter(key => key.status === 'active');
+        
+        keySelector.innerHTML = `
+            <option value="">Select Key</option>
+            ${activeKeys.map((key, index) => {
+                const keyIndex = this.keys.indexOf(key);
+                return `<option value="${keyIndex}">Key ${keyIndex + 1} - ${this.truncateKey(key.publicKey)}</option>`;
+            }).join('')}
+        `;
+    }
+
+    toggleKeyStatus(index) {
+        try {
+            if (index < 0 || index >= this.keys.length) {
+                this.showError('Invalid key index');
+                return;
+            }
+
+            const key = this.keys[index];
+            key.status = key.status === 'active' ? 'inactive' : 'active';
+            
+            localStorage.setItem('keys', JSON.stringify(this.keys));
+            this.updateKeysList();
+            this.updateKeySelector();
+            
+            this.showNotification(`Key ${index + 1} ${key.status === 'active' ? 'activated' : 'deactivated'}`);
+        } catch (error) {
+            console.error('Error toggling key status:', error);
+            this.showError('Failed to toggle key status');
+        }
+    }
+
+    updateKeysList() {
+        const keysList = document.getElementById('keysList');
+        keysList.innerHTML = '';
+        
+        this.keys.forEach((key, index) => {
+            const keyItem = document.createElement('div');
+            keyItem.className = `key-item ${key.status || 'active'}`;
+            
+            const decryptedPrivateKey = this.getDecryptedPrivateKey(key);
+            
+            const keyInfo = document.createElement('div');
+            keyInfo.className = 'key-info';
+            keyInfo.innerHTML = `
+                <div class="key-container">
+                    <div class="key-header">
+                        <div class="key-title-group">
+                            <span class="key-title">Key ${index + 1}</span>
+                            <span class="key-status ${key.status || 'active'}">${key.status || 'active'}</span>
+                        </div>
+                        <span class="key-date">${new Date(key.createdAt).toLocaleDateString()}</span>
+                    </div>
+                    
+                    <div class="key-content">
+                        <div class="key-field">
+                            <label>Public Key:</label>
+                            <div class="key-value" title="${key.publicKey}">
+                                ${this.truncateKey(key.publicKey)}
+                            </div>
+                        </div>
+                        
+                        <div class="key-field">
+                            <label>Private Key:</label>
+                            <div class="key-value" title="${decryptedPrivateKey}">
+                                ${this.truncateKey(decryptedPrivateKey)}
+                            </div>
+                        </div>
+                    </div>
+                    
+                    <div class="key-actions">
+                        <button class="action-btn copy-btn" data-index="${index}" data-type="public">
+                            <span class="btn-icon">📋</span> Copy Public
+                        </button>
+                        <button class="action-btn copy-btn" data-index="${index}" data-type="private">
+                            <span class="btn-icon">🔑</span> Copy Private
+                        </button>
+                        <button class="action-btn toggle-btn" data-index="${index}">
+                            <span class="btn-icon">${key.status === 'inactive' ? '🔓' : '🔒'}</span>
+                            ${key.status === 'inactive' ? 'Activate' : 'Deactivate'}
+                        </button>
+                        <button class="action-btn export-btn" data-index="${index}">
+                            <span class="btn-icon">📤</span> Export
+                        </button>
+                        <button class="action-btn delete-btn" data-index="${index}">
+                            <span class="btn-icon">🗑️</span> Delete
+                        </button>
+                    </div>
+                </div>
+            `;
+            
+            keyItem.appendChild(keyInfo);
+            keysList.appendChild(keyItem);
+        });
+
+        // Add event listeners for buttons
+        document.querySelectorAll('.copy-btn').forEach(button => {
+            button.addEventListener('click', (e) => {
+                const index = parseInt(e.target.closest('.copy-btn').dataset.index);
+                const type = e.target.closest('.copy-btn').dataset.type;
+                if (type === 'public') {
+                    this.copyPublicKey(index);
+                } else if (type === 'private') {
+                    this.copyPrivateKey(index);
+                }
+            });
+        });
+
+        document.querySelectorAll('.toggle-btn').forEach(button => {
+            button.addEventListener('click', (e) => {
+                const index = parseInt(e.target.closest('.toggle-btn').dataset.index);
+                this.toggleKeyStatus(index);
+            });
+        });
+
+        document.querySelectorAll('.export-btn').forEach(button => {
+            button.addEventListener('click', (e) => {
+                const index = parseInt(e.target.closest('.export-btn').dataset.index);
+                this.exportSingleKey(index);
+            });
+        });
+
+        document.querySelectorAll('.delete-btn').forEach(button => {
+            button.addEventListener('click', (e) => {
+                const index = parseInt(e.target.closest('.delete-btn').dataset.index);
+                if (confirm('Are you sure you want to delete this key?')) {
+                    this.deleteKey(index);
+                }
+            });
+        });
+    }
+
+    async exportSingleKey(index) {
+        try {
+            const key = this.keys[index];
+            if (!key) {
+                this.showError('Key not found');
+                return;
+            }
+
+            const exportData = {
+                version: '1.0',
+                timestamp: new Date().toISOString(),
+                key: {
+                    publicKey: key.publicKey,
+                    encryptedPrivateKey: key.encryptedPrivateKey,
+                    salt: key.salt,
+                    keyType: key.keyType,
+                    createdAt: key.createdAt
+                }
+            };
+
+            const blob = new Blob([JSON.stringify(exportData, null, 2)], { type: 'application/json' });
+            const url = URL.createObjectURL(blob);
+            
+            const a = document.createElement('a');
+            a.href = url;
+            a.download = `maci-key-${index + 1}-${new Date().toISOString().split('T')[0]}.json`;
+            document.body.appendChild(a);
+            a.click();
+            
+            URL.revokeObjectURL(url);
+            document.body.removeChild(a);
+            
+            this.showNotification('Key exported successfully');
+        } catch (error) {
+            console.error('Export error:', error);
+            this.showError('Failed to export key');
         }
     }
 
     async signMessage() {
-        const selectedKeyIndex = document.getElementById('selectedKey').value;
-        const message = document.getElementById('messageToSign').value;
-
-        if (!selectedKeyIndex || !message) {
-            this.showError('Please select a key and enter a message');
-            return;
-        }
-
         try {
-            const key = this.keys[selectedKeyIndex];
-            let privateKey = key.privateKey;
-
-            if (key.isEncrypted) {
-                privateKey = MACICrypto.decryptPrivateKey(key.privateKey, this.password, key.salt);
+            if (!this.password) {
+                this.showError('Please log in first');
+                return;
             }
 
-            const signature = await MACICrypto.signMessage(message, privateKey);
+            const messageInput = document.getElementById('messageToSign');
+            const keySelector = document.getElementById('selectedKey');
+            const signatureResult = document.getElementById('signatureResult');
 
-            const resultBox = document.getElementById('signatureResult');
-            resultBox.classList.remove('hidden');
-            resultBox.innerHTML = `
+            if (!messageInput || !keySelector || !signatureResult) {
+                this.showError('Required elements not found');
+                return;
+            }
+
+            const message = messageInput.value.trim();
+            const selectedKeyIndex = keySelector.value;
+
+            if (!message) {
+                this.showError('Please enter a message to sign');
+                return;
+            }
+
+            if (selectedKeyIndex === '' || !this.keys[selectedKeyIndex]) {
+                this.showError('Please select a valid key');
+                return;
+            }
+
+            const key = this.keys[selectedKeyIndex];
+            const decryptedPrivateKey = MACICrypto.decryptPrivateKey(
+                key.encryptedPrivateKey,
+                this.password,
+                key.salt
+            );
+
+            const signature = await MACICrypto.signMessage(message, decryptedPrivateKey);
+
+            // Update signature output
+            signatureResult.classList.remove('hidden');
+            signatureResult.innerHTML = `
                 <div class="signature-container">
-                    <h4>MACI Message Signature</h4>
+                    <h4>Signature Generated</h4>
                     <div class="signature-details">
                         <div class="signature-row">
                             <span class="signature-label">Message:</span>
@@ -348,25 +847,107 @@ class MAICKeyManager {
                         </div>
                         <div class="signature-row">
                             <span class="signature-label">Signature:</span>
-                            <span class="signature-value">${this.truncateKey(signature)}</span>
-                            <button class="icon-button" onclick="navigator.clipboard.writeText('${signature}')">
-                                <span class="material-icons">content_copy</span>
-                            </button>
+                            <span class="signature-value">${signature}</span>
                         </div>
+                        <div class="signature-row">
+                            <span class="signature-label">Public Key:</span>
+                            <span class="signature-value">${key.publicKey}</span>
+                        </div>
+                    </div>
+                    <div class="signature-actions">
+                        <button class="action-btn copy-btn" onclick="window.keyManager.copySignedMessage('${message}', '${signature}')">
+                            <span class="btn-icon">📋</span> Copy All
+                        </button>
                     </div>
                 </div>
             `;
 
-            await this.saveToHistory({
+            // Add to history
+            const historyEntry = {
                 type: 'sign',
-                message,
-                signature,
                 timestamp: new Date().toISOString(),
-                keyUsed: this.truncateKey(key.publicKey)
-            });
+                data: {
+                    message,
+                    signature,
+                    publicKey: key.publicKey
+                }
+            };
+
+            this.saveToHistory(historyEntry);
+            this.showNotification('Message signed successfully');
+
         } catch (error) {
-            this.showError('Error signing message: ' + error.message);
+            console.error('Error signing message:', error);
+            this.showError('Failed to sign message');
         }
+    }
+
+    async copySignedMessage(message, signature) {
+        try {
+            const text = `Message: ${message}\nSignature: ${signature}`;
+            await this.copyToClipboard(text);
+        } catch (error) {
+            console.error('Error copying signed message:', error);
+            this.showError('Failed to copy signed message');
+        }
+    }
+
+    saveToHistory(entry) {
+        try {
+            this.history.unshift(entry);
+            // Keep only the last 50 entries
+            if (this.history.length > 50) {
+                this.history = this.history.slice(0, 50);
+            }
+            localStorage.setItem('history', JSON.stringify(this.history));
+            this.updateHistoryList();
+        } catch (error) {
+            console.error('Error saving to history:', error);
+        }
+    }
+
+    loadHistory() {
+        try {
+            const savedHistory = localStorage.getItem('history');
+            this.history = savedHistory ? JSON.parse(savedHistory) : [];
+            this.updateHistoryList();
+        } catch (error) {
+            console.error('Error loading history:', error);
+            this.history = [];
+        }
+    }
+
+    updateHistoryList() {
+        const historyList = document.getElementById('transactionsList');
+        if (!historyList) return;
+
+        historyList.innerHTML = this.history.map((entry, index) => `
+            <div class="history-item">
+                <div class="history-header">
+                    <span class="history-type ${entry.type}">${entry.type.toUpperCase()}</span>
+                    <span class="history-date">${new Date(entry.timestamp).toLocaleString()}</span>
+                </div>
+                <div class="history-details">
+                    <div class="history-row">
+                        <span class="history-label">Message:</span>
+                        <span class="history-value">${entry.data.message}</span>
+                    </div>
+                    <div class="history-row">
+                        <span class="history-label">Signature:</span>
+                        <span class="history-value">${this.truncateKey(entry.data.signature)}</span>
+                    </div>
+                    <div class="history-row">
+                        <span class="history-label">Public Key:</span>
+                        <span class="history-value">${this.truncateKey(entry.data.publicKey)}</span>
+                    </div>
+                </div>
+                <div class="history-actions">
+                    <button class="action-btn copy-btn" onclick="window.keyManager.copySignedMessage('${entry.data.message}', '${entry.data.signature}')">
+                        <span class="btn-icon">📋</span> Copy
+                    </button>
+                </div>
+            </div>
+        `).join('');
     }
 
     async loadKeys() {
@@ -381,164 +962,41 @@ class MAICKeyManager {
         }
     }
 
-    updateKeysList() {
-        const keysList = document.getElementById('keysList');
-        if (!keysList) return;
-        
-        keysList.innerHTML = this.keys.map((key, index) => `
-            <div class="key-item ${key.status === 'active' ? 'active' : 'inactive'}">
-                <div class="key-header">
-                    <div class="key-title">
-                        <strong>Key ${index + 1}</strong>
-                        <span class="key-badge ${key.status}">${key.status}</span>
-                        <span class="key-type">${key.keyType || 'EdDSA'}</span>
-                    </div>
-                    <div class="key-actions">
-                        <button class="icon-button" onclick="window.keyManager.copyPublicKey(${index})" title="Copy Public Key">
-                            <span class="material-icons">content_copy</span>
-                        </button>
-                        <button class="icon-button" onclick="window.keyManager.copyPrivateKey(${index})" title="Copy Private Key">
-                            <span class="material-icons">vpn_key</span>
-                        </button>
-                        <button class="icon-button toggle-btn" data-index="${index}" title="${key.status === 'active' ? 'Deactivate' : 'Activate'}">
-                            <span class="material-icons">
-                                ${key.status === 'active' ? 'toggle_on' : 'toggle_off'}
-                            </span>
-                        </button>
-                        <button class="icon-button warning" onclick="window.keyManager.deleteKey(${index})" title="Delete Key">
-                            <span class="material-icons">delete</span>
-                        </button>
-                    </div>
-                </div>
-                <div class="key-details">
-                    <div class="key-row">
-                        <span class="key-label">Public Key:</span>
-                        <span class="key-value" title="${key.publicKey}">${this.truncateKey(key.publicKey)}</span>
-                    </div>
-                    <div class="key-row">
-                        <span class="key-label">Private Key:</span>
-                        <span class="key-value" title="${key.privateKey}">${this.truncateKey(key.privateKey)}</span>
-                    </div>
-                    <div class="key-row">
-                        <span class="key-label">Created:</span>
-                        <span class="key-value">${new Date(key.createdAt).toLocaleString()}</span>
-                    </div>
-                    <div class="key-row">
-                        <span class="key-label">Purpose:</span>
-                        <span class="key-value">${key.purpose}</span>
-                    </div>
-                </div>
-            </div>
-        `).join('');
-
-        // Add event listeners for toggle buttons
-        keysList.querySelectorAll('.toggle-btn').forEach(btn => {
-            btn.addEventListener('click', (e) => {
-                const index = parseInt(e.currentTarget.dataset.index);
-                this.toggleKeyStatus(index);
-            });
-        });
-    }
-
-    async toggleKeyStatus(index) {
+    getDecryptedPrivateKey(key) {
+        if (!key || !key.encryptedPrivateKey || !this.password) return 'Login required';
         try {
-            const key = this.keys[index];
-            if (!key) {
-                throw new Error('Key not found');
-            }
-
-            // Toggle the status
-            key.status = key.status === 'active' ? 'inactive' : 'active';
-            
-            // Save to storage
-            await chrome.storage.local.set({ keys: this.keys });
-            
-            // Update UI
-            this.updateKeysList();
-            
-            // Show notification
-            this.showNotification(`Key ${key.status === 'active' ? 'activated' : 'deactivated'} successfully`);
-            
-            // Save to history
-            await this.saveToHistory({
-                type: 'status_change',
-                keyUsed: this.truncateKey(key.publicKey),
-                message: `Key ${key.status === 'active' ? 'activated' : 'deactivated'}`,
-                timestamp: new Date().toISOString()
-            });
-
-            // Update key selector if we're in signing mode
-            this.updateKeySelector();
+            return MACICrypto.decryptPrivateKey(
+                key.encryptedPrivateKey,
+                this.password,
+                key.salt
+            );
         } catch (error) {
-            console.error('Error toggling key status:', error);
-            this.showError('Failed to toggle key status: ' + error.message);
+            console.error('Error decrypting private key:', error);
+            return 'Decryption failed';
         }
     }
 
-    updateKeySelector() {
-        const selector = document.getElementById('selectedKey');
-        if (!selector) return;
-
-        // Only show active keys in the selector
-        const activeKeys = this.keys.filter(key => key.status === 'active');
-        
-        selector.innerHTML = `
-            <option value="">Select Key</option>
-            ${activeKeys.map((key, index) => `
-                <option value="${index}">Key ${index + 1} - ${this.truncateKey(key.publicKey)}</option>
-            `).join('')}
-        `;
+    truncateKey(key) {
+        if (!key) return 'N/A';
+        const start = key.slice(0, 8);
+        const end = key.slice(-8);
+        return `${start}...${end}`;
     }
 
-    async saveToHistory(transaction) {
-        try {
-            this.history.unshift(transaction);
-            this.history = this.history.slice(0, 50);
-            await chrome.storage.local.set({ history: this.history });
-            this.updateHistoryList();
-        } catch (error) {
-            console.error('Error saving to history:', error);
-        }
+    showNotification(message) {
+        const notification = document.createElement('div');
+        notification.className = 'notification success';
+        notification.textContent = message;
+        document.body.appendChild(notification);
+        setTimeout(() => notification.remove(), 3000);
     }
 
-    async loadHistory() {
-        try {
-            const result = await chrome.storage.local.get('history');
-            this.history = result.history || [];
-            this.updateHistoryList();
-        } catch (error) {
-            console.error('Error loading history:', error);
-        }
-    }
-
-    updateHistoryList() {
-        const historyList = document.getElementById('transactionsList');
-        if (!historyList) return;
-
-        historyList.innerHTML = this.history.map(tx => `
-            <div class="history-item">
-                <div class="history-header">
-                    <span class="history-type ${tx.type}">${tx.type.toUpperCase()}</span>
-                    <span class="history-date">${new Date(tx.timestamp).toLocaleString()}</span>
-                </div>
-                <div class="history-details">
-                    ${tx.type === 'sign' ? `
-                        <div class="history-row">
-                            <span class="history-label">Message:</span>
-                            <span class="history-value">${tx.message}</span>
-                        </div>
-                        <div class="history-row">
-                            <span class="history-label">Signature:</span>
-                            <span class="history-value">${this.truncateKey(tx.signature)}</span>
-                        </div>
-                    ` : ''}
-                    <div class="history-row">
-                        <span class="history-label">Key Used:</span>
-                        <span class="history-value">${tx.keyUsed}</span>
-                    </div>
-                </div>
-            </div>
-        `).join('');
+    showError(message) {
+        const notification = document.createElement('div');
+        notification.className = 'notification error';
+        notification.textContent = message;
+        document.body.appendChild(notification);
+        setTimeout(() => notification.remove(), 3000);
     }
 
     toggleTheme() {
@@ -557,27 +1015,6 @@ class MAICKeyManager {
             const themeIcon = document.querySelector('.theme-icon');
             themeIcon.textContent = result.theme === 'dark' ? '☀️' : '🌙';
         }
-    }
-
-    truncateKey(key) {
-        if (!key) return '';
-        return key.substring(0, 10) + '...' + key.substring(key.length - 8);
-    }
-
-    showNotification(message) {
-        const notification = document.createElement('div');
-        notification.className = 'notification success';
-        notification.textContent = message;
-        document.body.appendChild(notification);
-        setTimeout(() => notification.remove(), 3000);
-    }
-
-    showError(message) {
-        const notification = document.createElement('div');
-        notification.className = 'notification error';
-        notification.textContent = message;
-        document.body.appendChild(notification);
-        setTimeout(() => notification.remove(), 3000);
     }
 }
 
